@@ -33,10 +33,10 @@ void slcanCANable2::_serialSetup(){
     
     // CANable2 config
     setBitrate(_bitrate);
-    _write(CANableCommands::OPEN_CHANNEL);
     if (_is_fd) {
         setDataBitrate(_data_bitrate);
     }
+    _write(CANableCommands::OPEN_CHANNEL);
 }
 
 // Serial write
@@ -50,19 +50,127 @@ void slcanCANable2::_write(std::string str){
 
 // Serial read
 std::string slcanCANable2::_read(){
-    size_t bytes_available = _serial.rdbuf() -> in_avail();
     char next_char;
     std::string buffer;
 
-    for (int _ = 0; _ < bytes_available; _++) {
+    int timeout = 10;
+    auto start_time = std::chrono::steady_clock::now();
+
+    while(true) {
+
+        // elapsed time
+        auto elapsed_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time
+        ).count();
+
         _serial.get(next_char);
         if (next_char == _LINE_TERMINATOR) {
+            break;
+        } else if (elapsed_time >= timeout) {
             break;
         } else {
             buffer.push_back(next_char);
         }
     }
     return buffer;
+}
+
+// Get frame type char
+char slcanCANable2::_getFrameTypeChar(DataFrame frame) {
+
+    /* Frame type
+    * type code | is_df | is_extended | is_remote | is_brs |
+    *      t    |   0   |      0      |     0     |    0   | 0x00
+    *      T    |   0   |      1      |     0     |    0   | 0x04
+    *      R    |   0   |      1      |     1     |    0   | 0x06
+    *      r    |   0   |      0      |     1     |    0   | 0x02
+    *      d    |   1   |      0      |     0     |    0   | 0x08
+    *      D    |   1   |      1      |     0     |    0   | 0x0C
+    *      b    |   1   |      0      |     0     |    1   | 0x09
+    *      B    |   1   |      1      |     0     |    1   | 0x0D
+    */
+    uint8_t is_df = frame.is_fd;
+    uint8_t is_extended = frame.extended_id;
+    uint8_t is_remote = frame.is_remote;
+    uint8_t is_brs = frame.is_brs;
+
+    uint8_t type = (is_df << 3) | (is_extended << 2) | (is_remote << 1) | is_brs;
+
+    char type_char;
+
+    switch (type)
+    {
+    case 0x00 : type_char = 't';
+        break;
+    case 0x04 : type_char = 'T';
+        break;
+    case 0x06 : type_char = 'R';
+        break;
+    case 0x02 : type_char = 'r';
+        break;
+    case 0x08 : type_char = 'd';
+        break;
+    case 0x0C : type_char = 'D';
+        break;
+    case 0x09 : type_char = 'b';
+        break;
+    case 0x0D : type_char = 'B';
+        break;
+    default:
+        throw std::runtime_error("Invalid data frame");
+    }
+    
+    return type_char;
+}
+
+// Get data length char
+char slcanCANable2::_getFrameLengthChar(DataFrame frame) {
+
+    char length_char;
+    int dlc = frame.dlc;
+
+    if ( dlc >= 0 && dlc <= 8 ) {
+        length_char = char(dlc+48); // number as chars
+    } else {
+        switch (dlc)
+        {
+        case 12 : length_char = '9';
+            break;
+        case 16 : length_char = 'A';
+            break;
+        case 20 : length_char = 'B';
+            break;
+        case 24 : length_char = 'C';
+            break;
+        case 32 : length_char = 'D';
+            break;
+        case 48 : length_char = 'E';
+            break;
+        case 64 : length_char = 'F';
+            break;
+        default:
+            throw std::runtime_error("Invalid DLC");
+        }
+    }
+
+    return length_char;
+}
+
+// uint8_t to Hex pair converter
+
+void slcanCANable2::_uint8ToHexPair(uint8_t number, char* output) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    output[0] = hex_chars[(number >> 4) & 0x0F];
+    output[1] = hex_chars[number & 0x0F];
+}
+
+// uint32 to Hex pairs converter
+void slcanCANable2::_uint32ToHexPair(uint32_t number, char* output) {
+    const char hex_chars[] = "0123456789ABCDEF";
+    output[0] = hex_chars[(number >> 12) & 0x0F];
+    output[1] = hex_chars[(number >> 8) & 0x0F];
+    output[2] = hex_chars[(number >> 4) & 0x0F];
+    output[3] = hex_chars[number & 0x0F];
 }
 
 // Public methods
@@ -117,4 +225,35 @@ std::string slcanCANable2::getVersion(){
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
     version = _read();
     return version;
+}
+
+void slcanCANable2::send(DataFrame frame){
+    std::string can_message;
+    char type_char = _getFrameTypeChar(frame);
+    char lenght_char = _getFrameLengthChar(frame);
+
+    can_message.push_back(type_char); // add type char
+
+    // add id chars
+    char id_chars[4];
+    _uint32ToHexPair(frame.id, id_chars);
+    can_message.push_back(id_chars[0]);
+    can_message.push_back(id_chars[1]);
+    if (frame.extended_id) {
+        can_message.push_back(id_chars[2]);
+        can_message.push_back(id_chars[3]);
+    }
+
+    // add length char
+    can_message.push_back(lenght_char);
+
+    // add data chars
+    for (int i = 0; i < frame.dlc; i++) {
+        char data_chars[2];
+        _uint8ToHexPair(frame.data[i], data_chars);
+        can_message.push_back(data_chars[0]);
+        can_message.push_back(data_chars[1]);
+    }
+    
+    _write(can_message);
 }
